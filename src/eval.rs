@@ -20,8 +20,11 @@ struct Environment {
     with_scope: Option<Thunk>,
 }
 
+type DeferredThunk = Box<dyn FnOnce(&mut EvalContext) -> Result<Value>>;
+
 enum ThunkState {
     Suspended { expression: Expr, environment: EnvId, source_id: Option<String> },
+    Deferred(DeferredThunk),
     Evaluating,
     Evaluated(Result<Value>),
 }
@@ -201,6 +204,11 @@ impl EvalContext {
                 self.thunks[index].state = ThunkState::Evaluated(result.clone());
                 result
             }
+            ThunkState::Deferred(computation) => {
+                let result = computation(self);
+                self.thunks[index].state = ThunkState::Evaluated(result.clone());
+                result
+            }
         }
     }
 
@@ -256,6 +264,17 @@ impl EvalContext {
         let id = self.thunks.len();
         self.thunks.push(ThunkCell {
             state: ThunkState::Suspended { expression, environment, source_id },
+        });
+        Thunk(id)
+    }
+
+    fn defer<F>(&mut self, computation: F) -> Thunk
+    where
+        F: FnOnce(&mut EvalContext) -> Result<Value> + 'static,
+    {
+        let id = self.thunks.len();
+        self.thunks.push(ThunkCell {
+            state: ThunkState::Deferred(Box::new(computation)),
         });
         Thunk(id)
     }
@@ -487,28 +506,42 @@ impl EvalContext {
         environment: EnvId,
         source_id: Option<&str>,
         target: &mut BTreeMap<String, AttrTree>,
-    ) -> Result<()> {
-        let inherited = if let Some(from) = inherit.from() {
-            let expression = from.expr().ok_or_else(|| Error::unsupported("inherit-from has no expression"))?;
-            match self.eval_expression(expression, environment, source_id.map(str::to_owned))? {
-                Value::AttrSet(attributes) => Some(attributes),
-                other => return Err(Error::type_error("an attribute set after inherit-from", other.type_name())),
-            }
-        } else { None };
+    ) -> Result<Vec<(String, Thunk)>> {
+        let from_expression = if let Some(from) = inherit.from() {
+            Some(from.expr().ok_or_else(|| Error::unsupported("inherit-from has no expression"))?)
+        } else {
+            None
+        };
 
+        let mut created = Vec::new();
         for attr in inherit.attrs() {
             let Some(name) = self.eval_attr_name(attr, environment, source_id)? else { continue };
-            let value = if let Some(attributes) = &inherited {
-                attributes.get(&name).copied().ok_or_else(|| Error::new(
-                    ErrorKind::MissingAttribute,
-                    format!("inherit source has no attribute '{name}'"),
-                ))?
+            let value = if let Some(expression) = &from_expression {
+                // inherit (expr) field is equivalent to field = expr.field. Keep the
+                // source expression lazy until this inherited field is actually forced.
+                let expression = expression.clone();
+                let field = name.clone();
+                let deferred_source = source_id.map(str::to_owned);
+                self.defer(move |context| {
+                    let source = context.eval_expression(expression, environment, deferred_source)?;
+                    let attributes = match source {
+                        Value::AttrSet(attributes) => attributes,
+                        other => return Err(Error::type_error("an attribute set after inherit-from", other.type_name())),
+                    };
+                    let field_thunk = attributes.get(&field).copied().ok_or_else(|| Error::new(
+                        ErrorKind::MissingAttribute,
+                        format!("inherit source has no attribute '{field}'"),
+                    ))?;
+                    context.force(field_thunk)
+                })
             } else {
                 self.lookup(environment, &name)?
             };
-            Self::insert_attr_tree(target, &[name], value)?;
+
+            Self::insert_attr_tree(target, &[name.clone()], value)?;
+            created.push((name, value));
         }
-        Ok(())
+        Ok(created)
     }
 
     fn eval_attr_set(&mut self, set: &ast::AttrSet, parent: EnvId, source_id: Option<String>) -> Result<Value> {
@@ -525,7 +558,9 @@ impl EvalContext {
                     let thunk = self.suspend(expression, environment, source_id.clone());
                     Self::insert_attr_tree(&mut tree, &names, thunk)?;
                 }
-                Entry::Inherit(inherit) => self.add_inherit(&inherit, environment, source_id.as_deref(), &mut tree)?,
+                Entry::Inherit(inherit) => {
+                    self.add_inherit(&inherit, environment, source_id.as_deref(), &mut tree)?;
+                }
             }
         }
 
@@ -541,29 +576,36 @@ impl EvalContext {
     fn eval_let_in(&mut self, node: &ast::LetIn, parent: EnvId, source_id: Option<String>) -> Result<Value> {
         let environment = self.new_environment(Some(parent), None);
         let mut bindings = BTreeMap::new();
+        let mut inherited = Vec::new();
 
+        // First install ordinary let bindings. Let environments are recursive, so every
+        // name must exist before inherited expressions (which may refer to sibling names)
+        // can be evaluated.
         for entry in node.entries() {
             match entry {
                 Entry::AttrpathValue(binding) => {
                     let path = binding.attrpath().ok_or_else(|| Error::unsupported("let binding has no name"))?;
                     let Some(names) = self.eval_attr_path(&path, environment, source_id.as_deref())? else { continue };
                     if names.len() != 1 { return Err(Error::unsupported("nested let binding paths are not supported")); }
+                    let name = names[0].clone();
                     let expression = binding.value().ok_or_else(|| Error::unsupported("let binding has no value"))?;
                     let thunk = self.suspend(expression, environment, source_id.clone());
                     Self::insert_attr_tree(&mut bindings, &names, thunk)?;
+                    self.environments[environment].bindings.insert(name, thunk);
                 }
-                Entry::Inherit(inherit) => {
-                    self.add_inherit(&inherit, environment, source_id.as_deref(), &mut bindings)?;
-                }
+                Entry::Inherit(inherit) => inherited.push(inherit),
             }
         }
 
-        for (name, item) in bindings {
-            match item {
-                AttrTree::Leaf(thunk) => { self.environments[environment].bindings.insert(name, thunk); }
-                AttrTree::Branch(_) => return Err(Error::unsupported("nested let binding paths are not supported")),
+        // Inherit bindings are also installed in the recursive frame. Their source-side
+        // lookup remains deferred until the inherited value is demanded.
+        for inherit in inherited {
+            let created = self.add_inherit(&inherit, environment, source_id.as_deref(), &mut bindings)?;
+            for (name, thunk) in created {
+                self.environments[environment].bindings.insert(name, thunk);
             }
         }
+
         let body = node.body().ok_or_else(|| Error::unsupported("let expression has no body"))?;
         self.eval_expression(body, environment, source_id)
     }
