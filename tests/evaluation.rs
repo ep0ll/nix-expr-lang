@@ -75,12 +75,12 @@ fn native_primop_is_called_by_nix() -> Result<()> {
 
 #[test]
 fn native_file_evaluator_resolves_relative_imports() -> Result<()> {
-    let directory = tempfile::tempdir()?;
-    std::fs::write(directory.path().join("answer.nix"), "40 + 2")?;
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+    std::fs::write(directory.path().join("answer.nix"), "40 + 2").expect("write answer.nix");
     std::fs::write(
         directory.path().join("default.nix"),
         "import ./answer.nix",
-    )?;
+    ).expect("write default.nix");
 
     let evaluator = Evaluator::new()?;
     let value = evaluator.eval_file(directory.path().join("default.nix"))?;
