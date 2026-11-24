@@ -107,6 +107,8 @@ Primops are registered in Nix's process-wide registry. Register them before crea
 
 A custom fetcher can call the application's HTTP client, verify hashes, add content to the Nix store using the store API, and return a Nix path. The policy and network implementation stay in the embedding application; Nix remains responsible for evaluating the expression that invokes the function.
 
+Before adding a custom fetcher, check whether Nix already provides the operation you need. The native evaluator includes its own builtins such as builtins.fetchurl, builtins.fetchTarball, builtins.fetchGit, and builtins.fetchClosure. These execute through Nix's own evaluator and store/fetcher implementation; they are not reimplemented by this crate. Their behavior remains subject to the linked Nix version, evaluator settings, network configuration and restricted/pure evaluation mode.
+
 ## Configure the evaluator
 
 ~~~rust
