@@ -57,6 +57,13 @@ fn selection_default_is_used_for_missing_attribute() {
 }
 
 #[test]
+fn selection_default_covers_non_attrset_intermediates() {
+    let mut context = EvalContext::new();
+    assert!(matches!(context.eval("true.missing or 42").unwrap(), Value::Integer(42)));
+    assert!(matches!(context.eval("{ a = 1; }.a.b or 42").unwrap(), Value::Integer(42)));
+}
+
+#[test]
 fn nested_attrpaths_and_inherit_work() {
     assert_eq!(eval_integer("let x = 42; in { inherit x; }.x"), 42);
     assert_eq!(eval_integer("{ a.b = 42; }.a.b"), 42);
