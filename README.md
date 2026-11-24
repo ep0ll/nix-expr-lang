@@ -1,63 +1,179 @@
 # nix-expr-lang
 
-An embeddable Rust interpreter for the Nix expression language.
+An embeddable Rust API for evaluating the real Nix expression language, backed by the upstream Nix evaluator (libexpr).
 
-This project is a library first. It is intended to let applications evaluate Nix expressions and bind their own native functions, import resolvers, filesystem policies, fetchers, and other host services without embedding the Nix package manager or CLI.
+This project does not reimplement the Nix grammar, runtime, lazy evaluation, closures, builtins, coercion rules, string contexts, or store semantics. It uses the existing Nix C API through the Rust nix-bindings wrapper. Nix parses and evaluates expressions; this crate provides an embedding-oriented API and a place for applications to register their own native operations.
 
-## Design goals
+The old experimental Rust evaluator has been removed on this branch. It was a partial implementation and could not provide complete Nix semantics.
 
-- Nix syntax, not Nickel syntax.
-- Call-by-need evaluation with memoized thunks and recursion detection.
-- Lexical closures, recursive bindings, lazy lists, and lazy attribute values.
-- A narrow host boundary for imports and custom source loading.
-- Explicit registration of native functions; no implicit NixOS-specific builtins.
-- Parser and evaluator are separate, with rnix providing the Nix grammar and Rowan syntax tree.
+## What is evaluated
 
-## Quick start
+The evaluation engine is the installed Nix version's own libexpr. That includes the language constructs, lazy evaluation, builtins and evaluator behavior implemented by that Nix release. This is not a Nickel interpreter and does not translate Nix expressions into another language.
 
-```toml
+This is also not a replacement for the Nix CLI or all Nix services. Features such as derivation realization, store operations, network fetching, flakes, and import behavior depend on the linked Nix libraries, configured store, permissions and optional features. The Nix expression evaluator itself is upstream code, not a compatibility subset maintained here.
+
+## Requirements
+
+- Nix with its development libraries and C API headers installed.
+- Rust 1.95 or later.
+- pkg-config, used by nix-bindings build scripts to locate the installed Nix libraries.
+
+The Rust binding is pinned to a specific upstream revision so the wrapper API does not silently drift. The pinned wrapper targets Nix 2.35.6. Use a matching Nix installation and consult the binding's build documentation for platform-specific requirements.
+
+## Add as a dependency
+
+During development, use this branch:
+
+~~~toml
 [dependencies]
-nix-expr-lang = { git = "https://github.com/ep0ll/nix-expr-lang" }
-```
+nix-expr-lang = {
+  git = "https://github.com/ep0ll/nix-expr-lang",
+  branch = "feat/libexpr-runtime-backend"
+}
+~~~
 
-```rust
-use nix_expr_lang::{EvalContext, Result, Value};
+## Evaluate Nix expressions
+
+~~~rust
+use nix_expr_lang::{EvaluatorBuilder, NixValueOps, Result};
 
 fn main() -> Result<()> {
-    let mut eval = EvalContext::new();
+    let evaluator = EvaluatorBuilder::new()?.build()?;
 
-    eval.register_native("fetch_text", 1, |context, args| {
-        let url = context.force(args[0])?;
-        let Value::String(url) = url else {
-            return Err(nix_expr_lang::Error::new(
-                nix_expr_lang::ErrorKind::Type,
-                "fetch_text expects a string URL",
-            ));
-        };
-
-        // Call your own HTTP client, cache, credential provider, or test double here.
-        Ok(Value::String(format!("fetched by host: {url}")))
-    });
-
-    let value = eval.eval(r#"
-        let source = fetch_text "https://example.invalid/source";
-        in { source = source; enabled = true; }
+    let value = evaluator.eval(r#"
+        let
+          add = x: y: x + y;
+          unused = throw "this binding is never forced";
+        in
+          add 19 23
     "#)?;
 
-    println!("{value:?}");
+    assert_eq!(value.as_int()?, 42);
     Ok(())
 }
-```
+~~~
 
-Native callbacks receive lazy `Thunk` handles. A callback chooses when and whether to force each argument, so host functions can implement their own strictness and avoid evaluating unused arguments.
+Evaluator::eval returns the upstream nix_bindings::Value. It is a handle into Nix's GC-managed runtime and borrows the evaluation session. Keep the Evaluator alive while using values returned by it.
 
-For import support, implement `Host::load_source`, construct the context with that host, and call `install_import()`. The host owns path resolution, source identity, permissions, network policy, and caching.
+For a source containing relative paths or imports, pass the base directory explicitly:
 
-## Current status
+~~~rust
+let value = evaluator.eval_at(
+    "import ./config.nix",
+    "/work/project",
+)?;
+~~~
 
-This is an early foundation, not a complete or drop-in-compatible Nix evaluator. The current implementation covers a useful core of expressions and demonstrates the runtime/host separation. It still has important semantic gaps; see [DESIGN.md](DESIGN.md). In particular, do not use it to evaluate untrusted expressions or production Nixpkgs until the conformance and security work is complete.
+Or evaluate a file directly:
 
+~~~rust
+let value = evaluator.eval_file("/work/project/default.nix")?;
+~~~
 
-## Architecture notes
+## Bind application logic as native Nix primops
 
-See [DESIGN.md](DESIGN.md) and [docs/upstream-architecture.md](docs/upstream-architecture.md) for the runtime design, the Nix/Nickel implementation comparison, and the host boundary.
+Nix's C API supports registering custom primitive operations. The wrapper exposes these as Rust callbacks. This is the intended integration point for application-specific capabilities such as artifact resolution, internal registries, custom source providers, or organization-specific fetchers.
+
+~~~rust
+use nix_expr_lang::{
+    EvaluatorBuilder,
+    NixValueOps,
+    Result,
+    primop::PrimOpRet,
+};
+
+fn main() -> Result<()> {
+    let mut builder = EvaluatorBuilder::new()?;
+
+    builder.register_primop(
+        "host_double",
+        1,
+        Some("Double an integer using the embedding application"),
+        |args, result: &mut PrimOpRet<'_>| {
+            let number = args[0].as_int()?;
+            result.set_int(number * 2)
+        },
+    )?;
+
+    let evaluator = builder.build()?;
+    let value = evaluator.eval("builtins.host_double 21")?;
+
+    assert_eq!(value.as_int()?, 42);
+    Ok(())
+}
+~~~
+
+Primops are registered in Nix's process-wide registry. Register them before creating the evaluator state that should see them. The callback's argument and return wrappers are valid only for the duration of the callback; do not store them or move them to another thread.
+
+A custom fetcher can call the application's HTTP client, verify hashes, add content to the Nix store using the store API, and return a Nix path. The policy and network implementation stay in the embedding application; Nix remains responsible for evaluating the expression that invokes the function.
+
+## Configure the evaluator
+
+~~~rust
+use nix_expr_lang::{EvaluatorBuilder, Result};
+
+fn main() -> Result<()> {
+    let mut builder = EvaluatorBuilder::with_store_uri("local")?;
+    builder
+        .lookup_path([
+            "nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixpkgs",
+        ])
+        .no_load_config();
+
+    let evaluator = builder.build()?;
+    let value = evaluator.eval("<nixpkgs>")?;
+    println!("{}", value.value_type());
+    Ok(())
+}
+~~~
+
+no_load_config() skips Nix configuration and environment-derived evaluator settings. It does not imply pure evaluation, filesystem isolation, or a security sandbox.
+
+## API surface
+
+The crate re-exports useful upstream types: Context, Store, EvalState, EvalStateBuilder, Value, ValueType, NixValueOps, Error, and Result. The underlying EvalState can be accessed through Evaluator::state().
+
+Use the upstream Value methods for:
+- Forcing values to weak-head normal form or deep evaluation.
+- Reading scalar values and Nix string contexts.
+- Reading attributes and list items lazily.
+- Calling Nix functions.
+- Creating values, paths, lists and attribute sets.
+- Working with store paths and derivations.
+
+See the nix-bindings documentation for the complete low-level and high-level APIs.
+
+## Architecture
+
+~~~text
+Embedding application
+    |
+    | EvaluatorBuilder / custom primops / Nix store APIs
+    v
+nix-expr-lang (this crate)
+    |
+    | safe Rust wrappers
+    v
+nix-bindings
+    |
+    | generated C bindings
+    v
+Nix C API (libexpr, libstore, libutil)
+    |
+    v
+Nix parser + evaluator + lazy runtime + builtin implementations
+~~~
+
+The boundary is intentionally small: this crate adapts the upstream evaluator instead of cloning it. See docs/architecture.md for the design details and upstream responsibilities.
+
+## Scope and caveats
+
+- The expression parser and evaluator are provided by the installed Nix version. This crate does not claim to extend or out-version the Nix language.
+- The Nix C API is experimental and may change between Nix versions. The nix-bindings project tracks these interfaces and contains the unsafe FFI layer.
+- The nix-bindings project also has optional C++ shims. They are deliberately disabled by default here. The cpp-shim feature is opt-in for cases that require a capability not exposed by the C API.
+- Flake operations are available behind the flakes feature when supported by the linked Nix version.
+- The evaluator is not automatically sandboxed. Do not evaluate untrusted expressions with unrestricted imports, store access, or powerful custom primops.
+
+## Development status
+
+This branch changes the implementation strategy from a homegrown subset to the upstream evaluator. Compilation and integration tests must be run on a machine with a compatible Nix development installation. A successful GitHub commit alone is not evidence of a successful native build.
