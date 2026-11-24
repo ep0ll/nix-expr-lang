@@ -55,6 +55,12 @@ Global registration has process scope and affects evaluator states created after
 
 Callbacks may force arguments selectively. A custom fetcher can read a lazy attribute-set argument field-by-field, call application code, put the result into a Nix store, and return an appropriate Nix value. The evaluator itself does not need to know how that fetcher works.
 
+### Nix's existing fetchers
+
+Do not reimplement a fetcher that Nix already provides. The native language includes builtins such as builtins.fetchurl, builtins.fetchTarball, builtins.fetchGit and builtins.fetchClosure. They run inside the upstream evaluator and use Nix's own fetcher/store implementation. Whether a particular fetch operation is available depends on the linked Nix version and evaluator restrictions; for example, fetchTarball and fetchurl are unavailable in restricted evaluation mode.
+
+A host primop is appropriate when an application needs a different source provider, credential model, cache, audit policy, or artifact registry. Otherwise, using the existing Nix builtin preserves upstream behavior and avoids duplicating fetcher semantics.
+
 ## C API versus C++ implementation headers
 
 Use the C API by default. The underlying C++ classes are internal implementation details with no general stable ABI guarantee. The binding project offers opt-in C++ shims, but they are experimental and should only be introduced to cover a demonstrated gap in the C API.
