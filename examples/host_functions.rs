@@ -1,39 +1,40 @@
 use nix_expr_lang::{
-    Error, ErrorKind, EvalContext, NixPath, NixPathKind, Result, Value,
+    EvaluatorBuilder,
+    NixValueOps,
+    Result,
+    primop::PrimOpRet,
 };
 
 fn main() -> Result<()> {
-    let mut evaluator = EvalContext::new();
+    let mut builder = EvaluatorBuilder::new()?;
 
-    // This is application code, not an interpreter builtin. The real implementation can
-    // use reqwest, a content-addressed cache, a credential provider, and a Nix store client.
-    evaluator.register_native("fetchurl", 1, |context, arguments| {
-        let specification = context.force(arguments[0])?;
-        let url = context.force_attr(&specification, "url")?
-            .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "fetchurl requires url"))?;
+    // This is an application capability exposed as a real Nix primop. The implementation
+    // can call an application's HTTP client, checksum verifier, artifact cache and store API.
+    builder.register_primop(
+        "host_fetch_metadata",
+        1,
+        Some("Fetch package metadata through the embedding application"),
+        |arguments, result: &mut PrimOpRet<'_>| {
+            let url = arguments[0].as_string()?;
 
-        let Value::String(url) = url else {
-            return Err(Error::new(ErrorKind::Type, "fetchurl url must be a string"));
-        };
+            // Replace this stand-in with application-specific fetching and verification.
+            result.set_string(&format!("resolved by host: {url}"))
+        },
+    )?;
 
-        // Stand-in for the store path returned by an actual host fetcher.
-        // The callback controls network and filesystem capabilities.
-        let store_path = format!("/nix/store/example-source-{}", url.len());
-        Ok(Value::Path(NixPath::new(store_path, NixPathKind::Absolute)))
-    });
-
-    let result = evaluator.eval(r#"
-        let
-          source = fetchurl {
-            url = "https://example.invalid/archive.tar.gz";
-            hash = "sha256-application-verifies-this";
-          };
-        in
-          { src = source; unpack = true; }
+    let evaluator = builder.build()?;
+    let value = evaluator.eval(r#"
+        {
+          source = builtins.host_fetch_metadata "https://example.invalid/source";
+          answer = 40 + 2;
+        }
     "#)?;
 
-    let source = evaluator.force_attr(&result, "src")?
-        .ok_or_else(|| Error::new(ErrorKind::InvalidArgument, "result has no src field"))?;
-    println!("{source:?}");
+    let answer = value.get_attr("answer")?;
+    assert_eq!(answer.as_int()?, 42);
+
+    let source = value.get_attr("source")?;
+    println!("{}", source.as_string()?);
+
     Ok(())
 }
