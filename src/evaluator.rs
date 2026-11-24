@@ -4,7 +4,7 @@ use std::{
 };
 
 use nix_bindings::{
-    Context, Error, EvalState, EvalStateBuilder, Result, Store, Value,
+    Context, EvalState, EvalStateBuilder, Result, Store, Value,
 };
 
 use crate::primop::{PrimOp, PrimOpArg, PrimOpRet};
@@ -24,7 +24,21 @@ pub struct EvaluatorBuilder {
 impl EvaluatorBuilder {
     /// Create a builder using Nix's default local store.
     pub fn new() -> Result<Self> {
-        Self::with_store_uri(None)
+        Self::with_options(None, true)
+    }
+
+    /// Create a builder without loading ambient Nix configuration during context
+    /// initialization or evaluator-state construction.
+    ///
+    /// Nix initializes some configuration process-wide. This constructor must be used
+    /// before another Nix Context is initialized if that distinction matters.
+    pub fn new_no_load_config() -> Result<Self> {
+        Self::with_options(None, false)
+    }
+
+    /// Create a builder for an explicit store URI without loading ambient Nix configuration.
+    pub fn with_store_uri_no_load_config(uri: impl AsRef<str>) -> Result<Self> {
+        Self::with_options(Some(uri.as_ref()), false)
     }
 
     /// Create a builder using an explicitly selected Nix store URI.
@@ -37,14 +51,22 @@ impl EvaluatorBuilder {
 
     /// Create a builder using the default store when `uri` is `None`.
     pub fn with_optional_store_uri(uri: Option<&str>) -> Result<Self> {
-        let context = Arc::new(Context::new()?);
+        Self::with_options(uri, true)
+    }
+
+    fn with_options(uri: Option<&str>, load_config: bool) -> Result<Self> {
+        let context = Arc::new(if load_config {
+            Context::new()?
+        } else {
+            Context::new_no_load_config()?
+        });
         let store = Arc::new(Store::open(&context, uri)?);
 
         Ok(Self {
             context,
             store,
             lookup_path: Vec::new(),
-            load_config: true,
+            load_config,
         })
     }
 
@@ -74,11 +96,13 @@ impl EvaluatorBuilder {
         self
     }
 
-    /// Do not load Nix configuration files or environment-derived evaluator settings.
+    /// Skip the evaluator-state configuration load.
     ///
-    /// This is useful for controlled embedding and reproducible tests. It does not by
-    /// itself enable pure evaluation or sandbox host callbacks.
-    pub fn no_load_config(&mut self) -> &mut Self {
+    /// This controls the EvalState builder only. The Nix context has already been
+    /// initialized by the time this method can be called. Use new_no_load_config() or
+    /// with_store_uri_no_load_config() to also request no-load behavior at context creation.
+    /// Neither mode enables pure evaluation or sandboxes host callbacks.
+    pub fn skip_eval_state_config(&mut self) -> &mut Self {
         self.load_config = false;
         self
     }
