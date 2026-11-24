@@ -110,6 +110,34 @@ fn unused_inherit_source_is_not_forced() {
 }
 
 #[test]
+fn list_and_attrset_equality_is_lazy_and_structural() {
+    let mut context = EvalContext::new();
+
+    assert!(matches!(context.eval("[ 1 2 ] == [ 1 2 ]").unwrap(), Value::Bool(true)));
+    assert!(matches!(
+        context.eval("{ a = 1; b = 2; } == { b = 2; a = 1; }").unwrap(),
+        Value::Bool(true)
+    ));
+
+    // A known mismatch must stop comparison before forcing later fields.
+    assert!(matches!(
+        context.eval("[ 1 (1 / 0) ] == [ 2 (1 / 0) ]").unwrap(),
+        Value::Bool(false)
+    ));
+    assert!(matches!(
+        context.eval("{ a = 1; b = 1 / 0; } == { a = 2; b = 1 / 0; }").unwrap(),
+        Value::Bool(false)
+    ));
+}
+
+#[test]
+fn lists_support_lexicographic_comparison() {
+    let mut context = EvalContext::new();
+    assert!(matches!(context.eval("[ 1 2 ] < [ 1 3 ]").unwrap(), Value::Bool(true)));
+    assert!(matches!(context.eval("[ 1 ] < [ 1 0 ]").unwrap(), Value::Bool(true)));
+}
+
+#[test]
 fn black_hole_detection_reports_infinite_recursion() {
     let mut context = EvalContext::new();
     let error = context.eval("let x = x; in x").unwrap_err();
