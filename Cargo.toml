@@ -1,0 +1,13 @@
+[package]
+name = "nix-expr-lang"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "An embeddable, lazy Nix expression language interpreter"
+repository = "https://github.com/ep0ll/nix-expr-lang"
+
+[dependencies]
+rnix = "0.15.1"
+
+[features]
+default = []
