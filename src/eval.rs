@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, mem, rc::Rc};
+use std::{collections::{BTreeMap, HashSet}, cmp::Ordering, mem, rc::Rc};
 
 use rnix::ast::{
     self, AstNode, Attr, BinOpKind, Entry, Expr, HasEntry, Inherit,
@@ -794,7 +794,16 @@ impl EvalContext {
         }
     }
 
-    fn primitive_equal(&self, lhs: &Value, rhs: &Value) -> Result<bool> {
+    fn primitive_equal(&mut self, lhs: &Value, rhs: &Value) -> Result<bool> {
+        self.values_equal(lhs, rhs, &mut HashSet::new())
+    }
+
+    fn values_equal(
+        &mut self,
+        lhs: &Value,
+        rhs: &Value,
+        visited: &mut HashSet<(usize, usize)>,
+    ) -> Result<bool> {
         match (lhs, rhs) {
             (Value::Null, Value::Null) => Ok(true),
             (Value::Bool(a), Value::Bool(b)) => Ok(a == b),
@@ -804,18 +813,56 @@ impl EvalContext {
             (Value::Float(a), Value::Integer(b)) => Ok(*a == *b as f64),
             (Value::String(a), Value::String(b)) => Ok(a == b),
             (Value::Path(a), Value::Path(b)) => Ok(a == b),
-            _ => Err(Error::unsupported("equality for lists, attribute sets, and functions is not implemented")),
+            (Value::List(a), Value::List(b)) => {
+                if a.len() != b.len() { return Ok(false); }
+                for (left, right) in a.iter().zip(b) {
+                    if !self.thunks_equal(*left, *right, visited)? { return Ok(false); }
+                }
+                Ok(true)
+            }
+            (Value::AttrSet(a), Value::AttrSet(b)) => {
+                if a.len() != b.len() { return Ok(false); }
+                for ((left_name, left_value), (right_name, right_value)) in a.iter().zip(b) {
+                    if left_name != right_name
+                        || !self.thunks_equal(*left_value, *right_value, visited)?
+                    {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (Value::Function(a), Value::Function(b)) => Ok(Rc::ptr_eq(&a.0, &b.0)),
+            _ => Ok(false),
         }
     }
 
-    fn compare(&self, lhs: Value, rhs: Value, operator: BinOpKind) -> Result<Value> {
-        let ordering = match (&lhs, &rhs) {
-            (Value::Integer(a), Value::Integer(b)) => a.partial_cmp(b),
-            (a, b) if a.as_float().is_some() && b.as_float().is_some() => a.as_float().unwrap().partial_cmp(&b.as_float().unwrap()),
-            (Value::String(a), Value::String(b)) => a.partial_cmp(b),
-            (a, _) => return Err(Error::type_error("comparable operands", a.type_name())),
+    fn thunks_equal(
+        &mut self,
+        left: Thunk,
+        right: Thunk,
+        visited: &mut HashSet<(usize, usize)>,
+    ) -> Result<bool> {
+        if left == right { return Ok(true); }
+
+        let pair = if left.index() <= right.index() {
+            (left.index(), right.index())
+        } else {
+            (right.index(), left.index())
         };
-        let ordering = ordering.ok_or_else(|| Error::new(ErrorKind::Arithmetic, "cannot order NaN"))?;
+        if !visited.insert(pair) {
+            return Err(Error::new(
+                ErrorKind::InfiniteRecursion,
+                "cyclic values encountered while comparing distinct thunks",
+            ));
+        }
+
+        let left_value = self.force(left)?;
+        let right_value = self.force(right)?;
+        self.values_equal(&left_value, &right_value, visited)
+    }
+
+    fn compare(&mut self, lhs: Value, rhs: Value, operator: BinOpKind) -> Result<Value> {
+        let ordering = self.values_ordering(&lhs, &rhs)?;
         let result = match operator {
             BinOpKind::Less => ordering.is_lt(),
             BinOpKind::LessOrEq => !ordering.is_gt(),
@@ -824,6 +871,34 @@ impl EvalContext {
             _ => unreachable!(),
         };
         Ok(Value::Bool(result))
+    }
+
+    fn values_ordering(&mut self, lhs: &Value, rhs: &Value) -> Result<Ordering> {
+        match (lhs, rhs) {
+            (Value::Integer(a), Value::Integer(b)) => Ok(a.cmp(b)),
+            (a, b) if a.as_float().is_some() && b.as_float().is_some() => {
+                a.as_float().unwrap().partial_cmp(&b.as_float().unwrap())
+                    .ok_or_else(|| Error::new(ErrorKind::Arithmetic, "cannot order NaN"))
+            }
+            (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
+            (Value::Path(a), Value::Path(b)) => Ok(a.raw.cmp(&b.raw)),
+            (Value::List(a), Value::List(b)) => {
+                for (left, right) in a.iter().zip(b) {
+                    if self.thunks_equal(*left, *right, &mut HashSet::new())? { continue; }
+                    let left_value = self.force(*left)?;
+                    let right_value = self.force(*right)?;
+                    return self.values_ordering(&left_value, &right_value);
+                }
+                Ok(a.len().cmp(&b.len()))
+            }
+            (Value::Integer(_) | Value::Float(_), Value::Integer(_) | Value::Float(_)) => {
+                unreachable!("all numeric pairs are covered by the mixed numeric arm")
+            }
+            (a, b) if a.type_name() == b.type_name() => {
+                Err(Error::type_error("values ordered as numbers, strings, paths, or lists", a.type_name()))
+            }
+            (a, _) => Err(Error::type_error("values of compatible comparable types", a.type_name())),
+        }
     }
 }
 
