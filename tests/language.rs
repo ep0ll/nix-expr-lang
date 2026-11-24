@@ -128,6 +128,10 @@ fn list_and_attrset_equality_is_lazy_and_structural() {
         context.eval("{ a = 1; b = 1 / 0; } == { a = 2; b = 1 / 0; }").unwrap(),
         Value::Bool(false)
     ));
+    assert!(matches!(
+        context.eval("let x = 7; y = 7; in { a = x; b = x; } == { a = y; b = y; }").unwrap(),
+        Value::Bool(true)
+    ));
 }
 
 #[test]
