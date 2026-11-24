@@ -657,12 +657,28 @@ impl EvalContext {
         let target = node.expr().ok_or_else(|| Error::unsupported("selection has no base expression"))?;
         let mut value = self.eval_expression(target, environment, source_id.clone())?;
         let path = node.attrpath().ok_or_else(|| Error::unsupported("selection has no attribute path"))?;
-        let names = self.eval_attr_path(&path, environment, source_id.as_deref())?.unwrap_or_default();
+        let names = match self.eval_attr_path(&path, environment, source_id.as_deref())? {
+            Some(names) => names,
+            None => {
+                if let Some(default) = node.default_expr() {
+                    return self.eval_expression(default, environment, source_id);
+                }
+                return Err(Error::new(
+                    ErrorKind::MissingAttribute,
+                    "dynamic attribute name resolved to null",
+                ));
+            }
+        };
 
         for name in names {
             let attributes = match value {
                 Value::AttrSet(attributes) => attributes,
-                other => return Err(Error::type_error("an attribute set during selection", other.type_name())),
+                other => {
+                    if let Some(default) = node.default_expr() {
+                        return self.eval_expression(default, environment, source_id);
+                    }
+                    return Err(Error::type_error("an attribute set during selection", other.type_name()));
+                }
             };
             let Some(thunk) = attributes.get(&name).copied() else {
                 if let Some(default) = node.default_expr() {
