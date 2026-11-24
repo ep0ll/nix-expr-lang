@@ -1,90 +1,140 @@
-# Architecture and implementation boundary
+# Design: delegate language semantics to Nix libexpr
 
-## Purpose
+## Decision
 
-nix-expr-lang is a library for embedding the Nix expression language in another Rust application. It is not a Nix command-line frontend, package manager, evaluator daemon, Nix store client, or derivation builder. Those systems can use the crate and install their own services without making those services part of the expression language implementation.
+The project uses the upstream Nix expression evaluator through the public Nix C API and a maintained Rust binding. It no longer owns a second parser, AST evaluator, thunk cache, closure implementation, or builtin table.
 
-The design separates four concerns:
+This is the credible way for an embedding library to offer complete evaluation of the Nix expression language without maintaining a second implementation of Nix semantics.
 
-1. Syntax parsing and source representation.
-2. Nix language evaluation and lazy runtime values.
-3. Host integration for source loading and native functions.
-4. Application policy, which remains outside the interpreter.
+The language implementation is versioned by the installed Nix libraries. This crate's job is to present an ergonomic and stable embedding boundary, not to outpace the upstream interpreter.
 
-## Why rnix
+## Components
 
-The lexer and parser are delegated to rnix. Its Rowan syntax tree preserves source text and syntax structure, and it exposes a typed AST for Nix constructs. Maintaining a second grammar would create a permanent compatibility burden: Nix syntax includes indented strings, interpolation, path forms, dynamic attribute names, set-pattern lambdas, recursive attrsets, legacy let syntax, and precedence-sensitive operators.
+~~~text
+Application
+  |-- evaluator configuration
+  |-- Nix store / filesystem policy
+  |-- custom primops and application services
+  v
+nix-expr-lang
+  |-- EvaluatorBuilder
+  |-- Evaluator
+  |-- primop convenience API
+  v
+nix-bindings
+  |-- safe Rust wrappers
+  |-- Value / EvalState / Store / Context
+  |-- PrimOp / external value adapters
+  v
+Nix C API
+  |-- libexpr
+  |-- libstore
+  |-- libutil
+  v
+Nix internals
+  |-- lexer and parser
+  |-- expression AST
+  |-- lazy evaluation and thunk forcing
+  |-- closures and recursive bindings
+  |-- builtin and primop implementations
+  |-- path and string-context semantics
+~~~
 
-The interpreter consumes the AST and owns evaluation semantics. Delegating parsing does not imply every AST construct is already evaluated by this crate.
+### Why not own an independent Rust evaluator?
 
-## Evaluation model
+A partial evaluator is deceptively easy to mistake for a Nix interpreter. Full compatibility requires far more than parsing common constructs. Semantics include lazy evaluation and blackholing, recursive scope resolution, function-pattern behavior, attribute set merge/update behavior, string contexts, paths, import resolution, error traces, numeric edge cases and the versioned builtin surface.
 
-The runtime is call-by-need:
+A homegrown implementation would also have to track changes to Nix. Even a comprehensive differential test suite cannot make a separately maintained evaluator free of semantic drift. The upstream evaluator already exists, is used by Nix itself, and is the definition of behavior for a matching Nix release.
 
-- A suspended thunk contains an expression, its lexical environment handle, and source identity.
-- Forcing transitions a thunk from suspended to evaluating to evaluated.
-- Re-entering an evaluating thunk reports infinite recursion (a black-hole check).
-- Successful results and errors are memoized.
-- Function arguments, list members, and attribute values are represented by thunk handles.
-- let bindings share one recursive lexical frame.
-- recursive attrsets expose their top-level fields through the environment captured by each field thunk.
-- evaluation returns weak-head normal form. Constructing a list or attrset does not force its elements/fields.
+## Native evaluation path
 
-The current implementation uses session-local arenas with integer handles. This avoids ownership cycles between recursive environments and delayed expressions, and makes an evaluation session a natural ownership boundary. The current context is single-threaded and is not Send/Sync.
+Evaluator::eval and Evaluator::eval_at call EvalState::eval_from_string. The Rust binding calls nix_expr_eval_from_string from nix_api_expr.h. Nix then:
+1. Parses the source through its own parser.
+2. Constructs its own expression representation.
+3. Evaluates through EvalState.
+4. Forces the top-level result to weak-head normal form.
+5. Returns a GC-managed nix_value wrapper to Rust.
 
-## Lexical lookup and with
+Evaluator::eval_file uses the Rust binding's file evaluator. Nix import expressions remain native Nix expressions and are handled by the linked evaluator, not by a Rust callback in this crate.
 
-Identifier lookup uses two passes. First, it checks the entire lexical environment chain. Only if no lexical binding exists does it force and inspect with-scopes from inner to outer. This prevents an inner with namespace from shadowing a let or function parameter from an outer lexical frame.
+The result Value preserves Nix's lazy runtime. Attribute members and list items remain lazy until the upstream value API or an expression forces them. The binding provides both lazy and forcing operations.
 
-## Host integration
+## Native integrations
 
-### Native functions
+### Store
 
-No standard library is installed implicitly. Applications register globals and native functions explicitly.
+EvaluatorBuilder creates or accepts a nix_bindings::Store. Applications can reuse a store they already own via EvaluatorBuilder::from_parts(context, store). Store realization, path validation, copying, and derivation operations should use the upstream store API rather than recreating Nix store formats.
 
-A native callback receives lazy Thunk arguments and a mutable EvalContext. It can force an argument using context.force(handle), leave an argument unevaluated, or return a host-created Value. This lets a fetcher, filesystem helper, secret provider, or project-specific operation live entirely in the embedding application.
+### Primops
 
-For example, an application can register fetchurl, fetchGit, readFile, or a company-specific artifact resolver. Those functions can use reqwest, a Nix store binding, a cache, credentials, or a mock service. None of those dependencies belong in the parser or expression evaluator.
+EvaluatorBuilder::register_primop adapts the safe nix_bindings::primop::PrimOp interface.
 
-### Imports
+Primops are the extension point for application operations that should appear inside Nix expressions. Examples:
+- An organization-specific artifact fetcher.
+- A package source resolver backed by an internal service.
+- An immutable configuration registry.
+- A secret or credential lookup that follows application-specific access policy.
+- A custom data source or content-addressed cache.
 
-The optional import binding is installed by calling install_import(). It delegates to the Host trait. Host implementations decide how relative paths are resolved, how search paths work, what locations may be read, how source identity is canonicalized, how remote imports are allowed, and how imported source is cached.
+The callback receives Nix values in a callback-scoped lifetime. Nix may pass lazy thunks; the callback should force only what it needs. A callback must not retain its borrowed argument/return wrappers past the call.
 
-The current Host interface is intentionally small. It is a seam for later policies; the current implementation does not yet provide complete Nix import semantics, cycle tracking, or a built-in filesystem resolver.
+Nix primop registration is process-global in the C API. A primop must be registered before constructing evaluator states that should contain it. This has consequences for tests and multi-tenant embedding: different per-session primop registries cannot be assumed. Use one process-wide registry or expose a namespaced dispatch primop that consults an application-owned registry.
 
-## Rust design choices
+### External values
 
-- Newtype handles prevent accidental mixing of arena indices with application integers.
-- Exhaustive Expr matching makes newly added parser AST variants visible to the evaluator at compile time.
-- Host is a Strategy boundary: local files, in-memory modules, remote registries, virtual filesystems, and test fixtures can provide different source-loading behavior.
-- LoaderHost is an Adapter for closure-based loaders.
-- EvalContext owns mutable runtime state; no process-global mutable singleton is needed.
-- Thunks are memoized computations, while native callback registration is a controlled extension point.
-- The runtime Value is distinct from the rnix syntax AST, avoiding accidental conflation of syntax and evaluated data.
+The upstream wrapper's external-value API allows Rust values to be represented as Nix external values with type-safe downcasting. Use this when a value is opaque to Nix expressions but should cross the language boundary. It is not a substitute for a serializable Nix value and should be used deliberately.
 
-## Implemented language surface in this milestone
+### Flakes
 
-The current evaluator includes integer and float literals, null/booleans, basic strings and interpolation, opaque path literals, identifiers, unary operations, arithmetic, comparisons for primitive values, boolean short-circuiting, lambdas, function application, simple and attribute-set pattern parameters, lists, non-recursive and recursive attribute sets, static/dynamic attribute names, nested attrpaths in attrsets, inherit bindings, let-in, with, if, assert, attribute selection with defaults, has-attribute, list concatenation, attrset update, and function-like attrsets via __functor.
+Flake APIs are optional and are exposed behind the crate's flakes feature. Flake evaluation and lockfile behavior are outside the core expression language API but can be added by applications that need them.
 
-This list describes the current code, not full conformance to Nix semantics.
+## C API and C++ shims
 
-## Known gaps and non-goals
+The primary backend uses the public Nix C API. It does not include or call Nix private C++ headers from this crate. Nix's C API is marked experimental upstream, so API and ABI compatibility across Nix releases must be treated as a dependency-management concern.
 
-A production-compatible Nix evaluator still requires substantial work:
+The Rust binding has optional C++ shims for operations not exposed by the C API. These are excluded from the default build. Enable cpp-shim only when a concrete integration requires it, and isolate such use behind a feature-gated module.
 
-- Full semantics for legacy let syntax, all syntax corner cases, source spans, and evaluation traces.
-- Path interpolation, path normalization, search path resolution, URI parsing, and correct path-vs-string behavior.
-- Nix-compatible string coercion and string context, including __toString, toString, store paths, and context-preserving concatenation.
-- Exact Nix numeric representation and overflow/division behavior across all edge cases.
-- Exact equality semantics for derivation-like attrsets and function identity corner cases; complete list/set/path ordering and subtle operator strictness.
-- Correct function/set-pattern defaults, ellipsis semantics, duplicate handling, and argument error behavior.
-- __curPos, throw/tryEval and the language-level error model.
-- Stack-safe evaluation, recursion/call-depth limits, interruption/cancellation, and resource accounting.
-- Import cycle detection, source caching, source maps, path policy, and full Nix search path behavior.
-- Extensive differential tests against the reference Nix evaluator, including Nixpkgs expressions.
+C++ #include lines are build-time implementation dependencies. They are unrelated to the Nix expression grammar. The language-level import keyword is evaluated by libexpr and may consult filesystem, search-path, or store facilities.
 
-Nix builtins, primops, store operations, derivation realization, package fetchers, NixOS module evaluation, and CLI behavior are deliberately not bundled into this initial library. They are either host-provided integrations or separate layers. The goal is to make those layers pluggable, not to silently ship partial substitutes.
+## Versioning and compatibility
 
-## Safety
+The dependency is pinned to a specific Git revision rather than a floating branch. The pinned nix-bindings revision tracks Nix 2.35.6 and requires Rust 1.95.0. The linked Nix development libraries must be compatible with the binding's expected headers and C API.
 
-An expression evaluator that can invoke host callbacks or import source is a capability boundary. Embedding applications must define an allowlist of native functions, constrain source loading, add evaluation limits, and decide whether expressions are trusted. The current milestone does not provide hardened resource limits or a sandbox.
+The effective language semantics are therefore:
+
+nix-expr-lang API version + nix-bindings revision + linked Nix libexpr version
+
+A release process should:
+1. Update the pinned binding revision intentionally.
+2. Build against the targeted Nix development package.
+3. Run the integration suite against that exact Nix runtime.
+4. Review the Nix C API changes and binding release notes.
+5. Record the supported Nix version range.
+
+## Why the C++ bindings are not the default
+
+Nix's C++ evaluator types and implementation headers are not a stable public ABI. Binding directly to EvalState, Value, Expr, parser internals or private headers would couple this crate to Nix implementation details and often to exact compiler/build flags.
+
+The public C API already exposes evaluation from a string, function application, forcing, value access, value construction, primop registration, and store functionality. Use that seam first. The experimental C++ shim remains an explicitly opt-in escape hatch.
+
+## Threading and capability model
+
+Nix evaluator state is mutable and backed by Nix's garbage collector. Follow the upstream wrapper's thread-safety rules: construct, use and drop Nix contexts/evaluator wrappers on a compatible thread; do not assume a mutex turns them into freely shareable concurrent objects. Primop callback handles are frame-scoped.
+
+The embedding application controls powerful effects:
+- Store selection and permissions.
+- Lookup paths and import roots.
+- Whether ambient Nix configuration is loaded.
+- Whether pure evaluation or other evaluator restrictions are enabled.
+- Which custom primops are registered and what those callbacks can access.
+
+This crate does not claim to sandbox untrusted Nix code. Use Nix's restriction settings and OS-level isolation where a security boundary is required.
+
+## Future work
+
+The next work should improve the embedding surface, not reimplement evaluator internals:
+- Add a capability-oriented host registry for configuring primops and services.
+- Wrap source access / path policy and Nix settings where the public C API permits.
+- Add optional flake and store convenience adapters.
+- Add version/build diagnostics and native integration tests.
+- Document Nix library installation for Linux/macOS and supported platforms.
