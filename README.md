@@ -113,12 +113,10 @@ A custom fetcher can call the application's HTTP client, verify hashes, add cont
 use nix_expr_lang::{EvaluatorBuilder, Result};
 
 fn main() -> Result<()> {
-    let mut builder = EvaluatorBuilder::with_store_uri("local")?;
-    builder
-        .lookup_path([
-            "nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixpkgs",
-        ])
-        .no_load_config();
+    let mut builder = EvaluatorBuilder::with_store_uri_no_load_config("local")?;
+    builder.lookup_path([
+        "nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixpkgs",
+    ]);
 
     let evaluator = builder.build()?;
     let value = evaluator.eval("<nixpkgs>")?;
@@ -127,7 +125,7 @@ fn main() -> Result<()> {
 }
 ~~~
 
-no_load_config() skips Nix configuration and environment-derived evaluator settings. It does not imply pure evaluation, filesystem isolation, or a security sandbox.
+with_store_uri_no_load_config() requests that ambient Nix configuration is not loaded during context initialization or evaluator-state construction. Nix's library initialization is process-wide, so it must be selected before another Nix Context is initialized. It does not imply pure evaluation, filesystem isolation, or a security sandbox.
 
 ## API surface
 
