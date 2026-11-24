@@ -1,3 +1,5 @@
+use serial_test::serial;
+
 use nix_expr_lang::{
     Evaluator,
     EvaluatorBuilder,
@@ -8,6 +10,7 @@ use nix_expr_lang::{
 };
 
 #[test]
+#[serial]
 fn delegates_expression_evaluation_to_native_libexpr() -> Result<()> {
     let evaluator = Evaluator::new()?;
 
@@ -29,6 +32,7 @@ fn delegates_expression_evaluation_to_native_libexpr() -> Result<()> {
 }
 
 #[test]
+#[serial]
 fn preserves_lazy_attribute_values_and_lists() -> Result<()> {
     let evaluator = Evaluator::new()?;
     let value = evaluator.eval(r#"
@@ -56,6 +60,7 @@ fn preserves_lazy_attribute_values_and_lists() -> Result<()> {
 }
 
 #[test]
+#[serial]
 fn native_primop_is_called_by_nix() -> Result<()> {
     let mut builder = EvaluatorBuilder::new()?;
     builder.register_primop(
@@ -74,6 +79,7 @@ fn native_primop_is_called_by_nix() -> Result<()> {
 }
 
 #[test]
+#[serial]
 fn native_file_evaluator_resolves_relative_imports() -> Result<()> {
     let directory = tempfile::tempdir().expect("temporary directory should be available");
     std::fs::write(directory.path().join("answer.nix"), "40 + 2").expect("write answer.nix");
