@@ -1,107 +1,166 @@
-# Upstream evaluator architecture notes
+# Nix and Nickel implementation study
 
-This document records the implementation-level distinctions used when designing this crate. It is not a claim of Nix compatibility. The linked source files are the primary references; the expression language manual is the semantic reference.
+This is a source-oriented comparison of the Nix expression evaluator and Nickel's Rust evaluator. It explains why the current implementation delegates Nix expression semantics to Nix's own libexpr rather than translating either evaluator into another partial interpreter.
 
-## Nix implementation: layers and ownership
+## Nix is the semantic authority
 
-Nix keeps several layers separate, even though the production evaluator integrates them through a large evaluation state:
+The Nix source tree separates parser grammar, expression nodes, runtime values, evaluation state and primitive operations:
 
-| Concern | Nix implementation | Responsibility |
+| Layer | Upstream source | Role |
 | --- | --- | --- |
-| Grammar | `src/libexpr/parser/parser.y` and the lexer/scanner implementation | Turns Nix source into parser AST nodes. |
-| Expression representation | `src/libexpr/include/nix/expr/nixexpr.hh` | Defines expression nodes such as lambdas, attrsets, let, with, lists and operators. |
-| Runtime values | `src/libexpr/include/nix/expr/value.hh` | Tagged runtime values, including lists, attrsets, functions, paths, strings and thunks. |
-| Evaluation state | `src/libexpr/include/nix/expr/eval.hh` | Owns evaluation-wide services, environments, parsing/evaluation caches, symbol tables, source and store integrations. |
-| Forcing | `src/libexpr/include/nix/expr/eval-inline.hh` | Forces delayed values and checks recursive forcing. |
-| Evaluation implementation | `src/libexpr/eval.cc` | Implements expression evaluation, lexical lookup, let/attrset construction, comparison and file evaluation. |
-| Primitive operations | `src/libexpr/primops.cc` plus store/fetcher libraries | Exposes operational capabilities such as imports, path/string operations and store-aware functions. |
+| Grammar | src/libexpr/parser/parser.y and lexer sources | Tokenizes and parses Nix expressions. |
+| Expression nodes | src/libexpr/include/nix/expr/nixexpr.hh | Represents parsed language constructs such as variables, lambdas, let, attrsets, lists and operators. |
+| Runtime values | src/libexpr/include/nix/expr/value.hh | Represents scalars, strings, paths, lists, attrsets, functions, thunks and external values. |
+| Evaluation state | src/libexpr/include/nix/expr/eval.hh | Owns evaluation memory, environments, symbol tables, settings, source/cache state and store integration. |
+| Forcing | src/libexpr/include/nix/expr/eval-inline.hh | Forces delayed values and handles recursive blackholes. |
+| Evaluation implementation | src/libexpr/eval.cc | Evaluates AST nodes, resolves variables, creates closures, implements recursive bindings, file evaluation and equality. |
+| Primitive operations | src/libexpr/primops.cc and related modules | Implements builtins, imports and operations connected to store/fetchers. |
+| Public embedding boundary | src/libexpr-c/nix_api_expr.h, nix_api_value.h and related headers | Exposes expression evaluation, values, function application, primops and store operations to embedders. |
 
-The C++ `#include` lines in these files are build-time dependencies between Nix implementation headers. They are not directives in the Nix expression language and should not become parser features in this crate. Nix source has its own grammar and comments. The expression-level `import` operation is an evaluator primitive; it is not a C/C++ preprocessor include.
+The language manual defines observable semantics; implementation source explains how Nix realizes them. The code should not assume every internal detail is an API contract.
 
-### Thunks and weak-head normal form
+### C API evaluation call chain
 
-Nix's runtime `Value` has an explicit thunk representation. A thunk retains an expression and its lexical `Env`. `EvalState::forceValue` changes the delayed value into a blackhole before evaluating the expression into that same value slot. A recursive force observes the blackhole and raises an infinite-recursion error. The language manual describes the observable call-by-need behavior: expressions are evaluated only when needed, and their results are reused.
+The public C API entry point nix_expr_eval_from_string is the crucial integration seam. Its implementation creates a source path, asks EvalState to parse the supplied Nix source, evaluates the parsed expression into a Nix Value, and forces that outer value. The Rust nix-bindings wrapper exposes this through EvalState::eval_from_string.
 
-This crate uses the same essential state machine, expressed with Rust ownership:
+Consequences for this repository:
 
-`Suspended(expression, environment) -> Evaluating -> Evaluated(result)`
+1. The real Nix lexer and parser are used. There is no parallel Rust grammar.
+2. Nix's own expression AST and evaluator dispatch are used. There is no Rust AST visitor that must track every language feature.
+3. Nix owns evaluation strictness, thunk caching, recursive environments, function calls and errors.
+4. The returned Rust Value is a handle to a Nix runtime value. It is not an eager conversion into Rust enums or JSON.
+5. Calls that need store, fetcher or filesystem behavior continue through the linked Nix runtime and its configured capabilities.
 
-A second `Deferred` state supports host-side delayed computations and lazy `inherit (expr) name` projections. The evaluator stores thunks in a session-owned arena and passes typed `Thunk` handles through values. That avoids `Rc<RefCell<...>>` cycles between mutually recursive environments and closures. It is a different memory representation from Nix's GC-managed in-place `Value`, not a translation of its C++ implementation.
+A language interpreter can be complete relative to a particular Nix release even though the C API is experimental and does not expose every CLI feature or every internal implementation hook. Those are separate claims. This project delegates expression evaluation to libexpr while documenting the C API boundary and version requirement.
 
-### Environments and variable resolution
+## Nix lazy evaluation
 
-Nix uses a static environment description for lexical bindings. An `ExprVar` carries a lexical level/displacement and a `fromWith` marker. `lookupVar` walks the environment chain to the precomputed frame; ordinary variables load a slot, while variables resolved through a `with` scope cause that scope to be forced and searched.
+### Thunks and blackholing
 
-The current Rust implementation keeps environment maps and resolves names dynamically. It preserves the key lookup rule—lexical bindings across the chain are checked before dynamic `with` scopes—but does not yet have Nix's static name-resolution pass. A future resolver should compile the rnix AST into a compact internal IR with resolved local slots, retaining a dynamic-with fallback for names that depend on runtime attribute sets.
+A Nix thunk stores an expression and the environment in which that expression was created. It is not just a memoized Rust closure: it participates in Nix's native Value representation and evaluator memory model.
 
-### Recursive sets, lets, lists and inherit
+The relevant forcing path is EvalState::forceValue in eval-inline.hh. When a value is a thunk, Nix:
+- Reads the thunk's expression and environment.
+- Changes the value slot into a blackhole before evaluating it.
+- Evaluates the expression into the value slot.
+- Reuses the resulting value on subsequent forces.
+- Detects a recursive attempt to force the same blackholed slot and reports infinite recursion.
+- Preserves evaluation failure details for diagnostic handling.
 
-Nix's `ExprAttrs::eval` creates a recursive environment frame before installing recursive fields. It allocates lazy values for fields, then exposes those values in the set. For recursive sets, normal fields are evaluated in the recursive environment; inherited fields and `inherit (expr)` have distinct environment rules. Dynamic attributes are evaluated after the static/recursive bindings have been prepared.
+This is call-by-need rather than call-by-name: an expression is computed at most once per thunk and the result is shared. Evaluating a list or attrset normally creates the outer container and delayed members, not a deep eager tree. Nix's explicit deep-force operations are different operations and can diverge on infinite or recursive values.
 
-`ExprLet::eval` likewise creates a new environment, installs each binding as a delayed value, and evaluates the body in that frame. `ExprList::eval` stores each list element as a delayed value rather than recursively evaluating every element immediately.
+The current crate keeps these semantics in Nix. Its public surface returns the upstream Value and exposes force, force_deep, get_attr_lazy, list_get_lazy, and ordinary forcing accessors through nix-bindings.
 
-The Rust implementation follows the same broad knot-tying approach for recursive let bindings, recursive attrsets and list members. `inherit (expr) name` is represented as a deferred projection, so an unused inherited member need not force the source expression. Exact inherited-binding corner cases, duplicate handling, recursive dynamic attribute names, `__overrides`, and detailed error positions still need differential tests against Nix.
+### Lexical environments and with
 
-### Import is not parsing
+Nix has both statically resolved lexical bindings and dynamically searched with scopes. In eval.hh an Env points to an outer Env and contains runtime slots. ExprVar carries a lexical level/displacement and a marker for variables resolved through with. lookupVar walks to the selected frame; ordinary variables read their slot, whereas a with-resolved variable searches the runtime attribute set.
 
-Nix's file evaluation path resolves a source path, checks its import-resolution and file-evaluation caches, parses the file, and evaluates the resulting expression. It is called by the `import` primitive. This means import is not part of the lexer grammar; it combines language-level binding with source resolution, file identity, caching, and host policy.
+This distinction matters: an evaluator that simply walks a chain of HashMaps and checks a with map at each frame can get shadowing order wrong. The production Nix evaluator already implements the actual rules; this repository does not introduce its own name resolver.
 
-The library keeps this operation behind `Host::load_source`. An embedding application can implement a filesystem, virtual filesystem, remote source registry, immutable source tree, or restricted resolver. The current adapter does not yet implement Nix's path canonicalization, search path, cache identity, cycle diagnostics, or evaluation cache.
+### Recursive attrsets and let
 
-### Where NixOS-specific behavior belongs
+ExprAttrs::eval builds a recursive environment frame before exposing recursive fields. Attribute expressions become delayed runtime values tied to the correct environment. Inherited fields and inherit-from expressions have distinct environment rules; dynamic attributes are evaluated in a later phase. Nix also supports override-specific behavior and extensive duplicate/error position handling.
 
-Nix's production evaluator is connected to the Nix store, derivation model, fetcher subsystem, source accessors, URI policy, string contexts and import-from-derivation machinery. This is visible in the evaluation interfaces and in primitive-operation implementations that call those services.
+ExprLet::eval similarly allocates an environment for the bindings and evaluates the body in that environment. The bindings are delayed and can refer to one another. ExprList::eval stores delayed element values.
 
-For an embeddable expression interpreter, those capabilities must be explicit host interfaces or separately layered packages:
+These details explain why the first experimental homegrown evaluator was not suitable as a complete interpreter. Matching the surface syntax is not enough; the evaluation environment and strictness rules are subtle, and changes in Nix's internal implementation would otherwise have to be reimplemented continuously.
 
-- Import/source loading: source identity, relative resolution, search paths, access control, caching.
-- Path operations: path normalization, filesystem abstraction, source accessor identity and path realization.
-- String contexts: propagation of store references and realization when a string is consumed by store-aware operations.
-- Fetchers: HTTP/Git/archive policy, hashes, cache, credentials and store insertion.
-- Derivations/store: derivation construction, output paths, realization and import-from-derivation.
+### Equality and ordering
 
-The current `Host` trait only provides source loading. Native functions are registered separately with `register_native`, and their arguments are lazy `Thunk` handles. This is sufficient to demonstrate the extension point, but it is not yet the complete host capability API needed for Nixpkgs evaluation.
+Nix equality forces the compared outer values and then compares supported types recursively. Lists and attribute sets require recursive element/field comparisons; functions are not comparable in the ordinary equality sense. Mixed integer/float comparison is special-cased. Derivation-like attribute sets have additional semantics involving outPath.
 
-## Nickel: what is reusable and what is not
+Ordering is a separate operator family with Nix-specific type restrictions. A Rust implementation that uses ordinary derived PartialEq on a recursive value tree would not reproduce those rules, and it could accidentally force fields or recurse forever in the wrong places.
 
-Nickel is useful as a Rust implementation study, not as the language front-end for this crate. Nickel's `core/src/eval/cache/lazy.rs` uses a thunk state with suspended, blackholed and evaluated states, closely matching the call-by-need / blackhole idea. Its comments also explain revertible thunks for recursive records and overriding: a recursive record is modeled as a fixpoint, and selected thunks can be restored when recomputing that fixpoint after a merge.
+### Builtins and fetchers
 
-That revertible-recursive-record mechanism is specific to Nickel's record merge and contract model. It should not be copied wholesale into Nix. Nix recursive attrsets have their own environment/attribute-binding semantics. Likewise, Nickel's typed term/value and contract machinery is not part of Nix syntax and is intentionally absent here.
+Nix's builtins are not a separate language grammar. They are runtime operations installed into the evaluator. The native evaluator contains operations such as fetchurl, fetchTarball, fetchGit and fetchClosure. These interact with the store, fetcher settings, URI policy, caches and purity/restricted-evaluation rules.
 
-The reusable lessons are narrower: separate syntax from evaluated values, isolate lazy cache state, make blackhole detection explicit, keep recursive environment ownership deliberate, and make evaluation errors contextual. The Nix grammar and Nix semantics remain authoritative.
+The Nixpkgs library also supplies many higher-level fetcher helpers as Nix expressions. Those are evaluated by the same interpreter after importing Nixpkgs. They are not parser features.
 
-## Rust design decisions
+This leads to two supported integration modes:
+- Use the builtin or Nixpkgs function when it already implements the desired operation.
+- Register a native primop when the embedding application needs a custom source provider, credentials policy, cache, registry, or external library.
 
-The guiding principle is to use Rust's type system and ownership model rather than reproducing class-oriented patterns mechanically.
+Custom primops execute inside the real Nix evaluator. Their arguments may be lazy Nix values, and the callback chooses which values to force. The Rust wrapper requires the callback to be Send + Sync + 'static because registration is process-wide and the callback is retained by Nix. Callback argument/result wrapper values have a callback-scoped lifetime and must not escape.
 
-- **Closed AST dispatch:** rnix's `Expr` is a closed enum. An exhaustive `match` acts as a compact visitor and makes new AST variants compiler-visible. A runtime plugin registry for grammar nodes would make core language semantics less predictable; host extensibility belongs at effects and native-function bindings.
-- **Newtype handle:** `Thunk` wraps an arena index so a thunk cannot be confused with an arbitrary integer. The handle is session-local.
-- **Arena ownership:** environments and thunks are owned by `EvalContext`; values retain handles instead of owning recursive environment graphs. This is preferable to accidental reference-counted cycles for recursive values.
-- **Strategy boundary:** `Host` is a trait for interchangeable source-resolution strategies. It can be implemented by a real filesystem, virtual source store, remote registry or test fixture.
-- **Adapter:** `LoaderHost` wraps a closure-based loader for embedding applications that do not need a named host type.
-- **Explicit capabilities:** native functions are registered by the embedding application. The expression evaluator itself does not silently acquire network, filesystem, process or store capabilities.
-- **Single mutable session:** the initial `EvalContext` uses `&mut self` and `Rc`; it is intentionally single-threaded. Concurrency should be designed with a clear evaluation-session boundary rather than adding locks to each thunk prematurely.
+## Import, source files and C++ includes
 
-Traditional Visitor, Strategy and Adapter descriptions are useful vocabulary, but the correct implementation depends on Rust's enum dispatch, traits, generics, borrowing and ownership. The Rust Patterns catalogue also emphasizes idioms and anti-patterns, not only named GoF patterns.
+The Nix expression keyword/builtin import is a language-level evaluator operation. It combines source/path resolution, parsing, evaluation and the Nix runtime's source/file caching. It is not a lexer directive.
+
+The C++ #include directives in Nix's implementation are ordinary build-time dependencies between C++ headers. They do not belong in Nix source parsing and they should not become a language feature in this crate.
+
+The wrapper's eval_from_file and eval_from_string APIs pass source into Nix's native evaluator. For application-owned source resolution, use the APIs and policy hooks exposed by Nix where possible. Do not build a second import system unless the application explicitly needs a virtual source abstraction that Nix cannot provide through its public interfaces.
+
+## Nickel: useful implementation study, different language
+
+Nickel's evaluator is implemented in Rust and is a useful source of design ideas. Its runtime has a distinct term representation, runtime value representation, evaluator cache and transformation pipeline. The following files are particularly relevant:
+
+- core/src/eval/cache/lazy.rs
+- core/src/term/mod.rs
+- core/src/eval/value/mod.rs
+- core/src/eval/value/lens.rs
+- core/src/term/record.rs
+
+### Nickel thunk states
+
+Nickel models thunk state as Blackholed, Suspended or Evaluated. Its lazy cache documentation explains the same fundamental invariant as Nix: mark a suspended computation as blackholed before evaluating it; a recursive force then identifies a blackhole instead of looping without bound; after successful evaluation the thunk contains its computed value.
+
+Nickel also stores evaluation data in explicit runtime terms and uses value lenses to mutate parts of shared runtime values. This reflects Nickel's own memory representation and transformation pipeline.
+
+### Revertible thunks and recursive records
+
+One particularly interesting Nickel mechanism is the revertible thunk. Nickel's comments explain recursive records as a fixpoint, conceptually similar to a function that receives the record itself. Revertible thunks memoize computations derived from this fixpoint but can restore their original expression when a recursive merge or override requires recomputation.
+
+That mechanism is specific to Nickel's merge/contract and recursive-record semantics. Nix recursive attribute sets have a different evaluator implementation, environment setup and override model. Copying Nickel's revertible-thunk design into a Nix interpreter would not produce Nix semantics.
+
+### What is reusable
+
+The reusable lessons are architectural:
+- Keep parsed syntax separate from runtime values.
+- Isolate lazy evaluation state.
+- Detect blackholes before recursively evaluating a thunk.
+- Keep ownership of recursive environments explicit.
+- Make forcing and deep forcing distinct operations.
+- Treat diagnostics, source positions and error traces as evaluator responsibilities.
+- Use Rust ownership, borrowing and typed handles to prevent runtime values escaping the state that owns them.
+
+The current branch deliberately uses the Nix implementation for these semantic responsibilities. Nickel informs the design review, but is not a dependency or evaluator backend.
+
+## Rust patterns used by this crate
+
+The wrapper uses a small number of patterns naturally suited to Rust:
+
+- **Adapter:** EvaluatorBuilder and Evaluator adapt the native C API into an embedding-friendly facade. The underlying EvalState and Value APIs remain available.
+- **RAII:** nix-bindings value/store/state wrappers release C and GC handles through Drop.
+- **Lifetimes as ownership contracts:** Value<'a> is tied to its EvalState; a host cannot safely retain a value handle after the evaluation state is dropped.
+- **Dependency injection:** EvaluatorBuilder::from_parts accepts an application-owned Context and Store.
+- **Strategy / callback extension:** custom primops inject behavior without changing the parser or evaluator implementation.
+- **Feature-gated integrations:** experimental C++ shims and flake APIs are optional build features rather than implicit dependencies.
+
+A Visitor implementation for Nix AST nodes is unnecessary here because Nix itself owns the AST and dispatch. Recreating those nodes in Rust would duplicate upstream semantics. The extension seam is host effects and primops, not plugin-defined syntax.
 
 ## References
 
 ### Nix
-- [Nix parser grammar](https://github.com/NixOS/nix/blob/master/src/libexpr/parser/parser.y)
-- [Nix expression AST](https://github.com/NixOS/nix/blob/master/src/libexpr/include/nix/expr/nixexpr.hh)
-- [Nix runtime values](https://github.com/NixOS/nix/blob/master/src/libexpr/include/nix/expr/value.hh)
-- [Nix evaluator interface](https://github.com/NixOS/nix/blob/master/src/libexpr/include/nix/expr/eval.hh)
-- [Nix thunk forcing](https://github.com/NixOS/nix/blob/master/src/libexpr/include/nix/expr/eval-inline.hh)
-- [Nix evaluator implementation](https://github.com/NixOS/nix/blob/master/src/libexpr/eval.cc)
-- [Nix primitive operations](https://github.com/NixOS/nix/blob/master/src/libexpr/primops.cc)
-- [Nix language reference](https://nix.dev/manual/nix/2.34/language)
+- Nix parser grammar: https://github.com/NixOS/nix/blob/master/src/libexpr/parser/parser.y
+- Nix AST: https://github.com/NixOS/nix/blob/master/src/libexpr/include/nix/expr/nixexpr.hh
+- Nix runtime values: https://github.com/NixOS/nix/blob/master/src/libexpr/include/nix/expr/value.hh
+- Nix evaluator interface: https://github.com/NixOS/nix/blob/master/src/libexpr/include/nix/expr/eval.hh
+- Nix thunk forcing: https://github.com/NixOS/nix/blob/master/src/libexpr/include/nix/expr/eval-inline.hh
+- Nix evaluator implementation: https://github.com/NixOS/nix/blob/master/src/libexpr/eval.cc
+- Nix public C API: https://github.com/NixOS/nix/blob/master/src/libexpr-c/nix_api_expr.h
+- Nix C API evaluator implementation: https://github.com/NixOS/nix/blob/master/src/libexpr-c/nix_api_expr.cc
+- Nix builtins manual: https://nix.dev/manual/nix/2.35/language/builtins.html
 
 ### Nickel
-- [Nickel lazy evaluation cache](https://github.com/nickel-lang/nickel/blob/master/core/src/eval/cache/lazy.rs)
-- [Nickel term representation](https://github.com/nickel-lang/nickel/blob/master/core/src/term/mod.rs)
-- [Nickel runtime values](https://github.com/nickel-lang/nickel/blob/master/core/src/eval/value/mod.rs)
+- Nickel lazy cache: https://github.com/nickel-lang/nickel/blob/master/core/src/eval/cache/lazy.rs
+- Nickel term representation: https://github.com/nickel-lang/nickel/blob/master/core/src/term/mod.rs
+- Nickel runtime values: https://github.com/nickel-lang/nickel/blob/master/core/src/eval/value/mod.rs
 
-### Rust patterns
-- [Rust Design Patterns catalogue](https://rust-unofficial.github.io/patterns/)
-- [Refactoring Guru: Rust design patterns](https://refactoring.guru/design-patterns/rust)
-- [Refactoring Guru Rust examples](https://github.com/RefactoringGuru/design-patterns-rust)
+### Rust
+- Rust Design Patterns catalogue: https://rust-unofficial.github.io/patterns/
+- Refactoring Guru: Rust design patterns: https://refactoring.guru/design-patterns/rust
+- Refactoring Guru Rust examples: https://github.com/RefactoringGuru/design-patterns-rust
+
+### Binding
+- nix-bindings source and build requirements: https://github.com/NotAShelf/nix-bindings
