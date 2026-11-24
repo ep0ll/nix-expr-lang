@@ -48,7 +48,7 @@ fn preserves_lazy_attribute_values_and_lists() -> Result<()> {
 
     assert_eq!(value.get_attr("answer")?.as_int()?, 42);
 
-    let values = value.get_attr("values")?;
+    let mut values = value.get_attr("values")?;
     values.force()?;
     assert_eq!(values.list_len()?, 3);
 
