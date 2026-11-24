@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, mem, rc::Rc};
 
 use rnix::ast::{
-    self, AstNode, Attr, AttrpathValue, BinOpKind, Entry, Expr, HasEntry, Inherit,
+    self, AstNode, Attr, BinOpKind, Entry, Expr, HasEntry, Inherit,
     InterpolPart, LiteralKind, Param, UnaryOpKind,
 };
 
@@ -542,16 +542,19 @@ impl EvalContext {
         let environment = self.new_environment(Some(parent), None);
         let mut bindings = BTreeMap::new();
 
-        for child in node.syntax().children() {
-            if let Some(binding) = AttrpathValue::cast(child.clone()) {
-                let path = binding.attrpath().ok_or_else(|| Error::unsupported("let binding has no name"))?;
-                let Some(names) = self.eval_attr_path(&path, environment, source_id.as_deref())? else { continue };
-                if names.len() != 1 { return Err(Error::unsupported("nested let binding paths are not supported")); }
-                let expression = binding.value().ok_or_else(|| Error::unsupported("let binding has no value"))?;
-                let thunk = self.suspend(expression, environment, source_id.clone());
-                Self::insert_attr_tree(&mut bindings, &names, thunk)?;
-            } else if let Some(inherit) = Inherit::cast(child) {
-                self.add_inherit(&inherit, environment, source_id.as_deref(), &mut bindings)?;
+        for entry in node.entries() {
+            match entry {
+                Entry::AttrpathValue(binding) => {
+                    let path = binding.attrpath().ok_or_else(|| Error::unsupported("let binding has no name"))?;
+                    let Some(names) = self.eval_attr_path(&path, environment, source_id.as_deref())? else { continue };
+                    if names.len() != 1 { return Err(Error::unsupported("nested let binding paths are not supported")); }
+                    let expression = binding.value().ok_or_else(|| Error::unsupported("let binding has no value"))?;
+                    let thunk = self.suspend(expression, environment, source_id.clone());
+                    Self::insert_attr_tree(&mut bindings, &names, thunk)?;
+                }
+                Entry::Inherit(inherit) => {
+                    self.add_inherit(&inherit, environment, source_id.as_deref(), &mut bindings)?;
+                }
             }
         }
 
