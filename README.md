@@ -56,3 +56,8 @@ For import support, implement `Host::load_source`, construct the context with th
 ## Current status
 
 This is an early foundation, not a complete or drop-in-compatible Nix evaluator. The current implementation covers a useful core of expressions and demonstrates the runtime/host separation. It still has important semantic gaps; see [DESIGN.md](DESIGN.md). In particular, do not use it to evaluate untrusted expressions or production Nixpkgs until the conformance and security work is complete.
+
+
+## Architecture notes
+
+See [DESIGN.md](DESIGN.md) and [docs/upstream-architecture.md](docs/upstream-architecture.md) for the runtime design, the Nix/Nickel implementation comparison, and the host boundary.
