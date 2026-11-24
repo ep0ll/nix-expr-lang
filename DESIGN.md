@@ -72,11 +72,11 @@ This list describes the current code, not full conformance to Nix semantics.
 
 A production-compatible Nix evaluator still requires substantial work:
 
-- Full semantics for legacy let syntax, all syntax corner cases, and improved diagnostics/spans.
+- Full semantics for legacy let syntax, all syntax corner cases, source spans, and evaluation traces.
 - Path interpolation, path normalization, search path resolution, URI parsing, and correct path-vs-string behavior.
 - Nix-compatible string coercion and string context, including __toString, toString, store paths, and context-preserving concatenation.
-- Exact Nix numeric representation and overflow/division behavior.
-- Full equality, ordering, list and attrset operations, and subtle operator strictness.
+- Exact Nix numeric representation and overflow/division behavior across all edge cases.
+- Exact equality semantics for derivation-like attrsets and function identity corner cases; complete list/set/path ordering and subtle operator strictness.
 - Correct function/set-pattern defaults, ellipsis semantics, duplicate handling, and argument error behavior.
 - __curPos, throw/tryEval and the language-level error model.
 - Stack-safe evaluation, recursion/call-depth limits, interruption/cancellation, and resource accounting.
