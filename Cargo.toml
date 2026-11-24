@@ -1,13 +1,18 @@
 [package]
 name = "nix-expr-lang"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.95"
 license = "MIT"
-description = "An embeddable, lazy Nix expression language interpreter"
+description = "An embeddable Nix expression evaluator backed by upstream libexpr"
 repository = "https://github.com/ep0ll/nix-expr-lang"
 
 [dependencies]
-rnix = "0.15.1"
+nix-bindings = { git = "https://github.com/NotAShelf/nix-bindings", rev = "5ab3f5e845150b6963c2895ed1c7963ab33aa300", default-features = false, features = ["expr", "primop", "external"] }
 
 [features]
 default = []
+# Enables the binding project's experimental C++ shims. Keep this opt-in:
+# the core evaluator and custom primops use the public Nix C API.
+cpp-shim = ["nix-bindings/shim"]
+flakes = ["nix-bindings/flake"]
