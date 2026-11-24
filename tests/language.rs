@@ -100,6 +100,16 @@ fn import_is_delegated_to_the_host() {
 }
 
 #[test]
+fn inherit_from_sibling_let_binding_works() {
+    assert_eq!(eval_integer("let source = { value = 42; }; inherit (source) value; in value"), 42);
+}
+
+#[test]
+fn unused_inherit_source_is_not_forced() {
+    assert_eq!(eval_integer("{ inherit (1 / 0) unreachable; }.missing or 42"), 42);
+}
+
+#[test]
 fn black_hole_detection_reports_infinite_recursion() {
     let mut context = EvalContext::new();
     let error = context.eval("let x = x; in x").unwrap_err();
