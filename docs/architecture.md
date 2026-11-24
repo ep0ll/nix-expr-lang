@@ -67,6 +67,19 @@ Use the C API by default. The underlying C++ classes are internal implementation
 
 The default crate feature set therefore includes expression evaluation, primops and external values but excludes the optional C++ shim. Store and filesystem behavior are still provided by Nix's C API and the Rust wrappers.
 
+## Rust design patterns and ownership
+
+The wrapper follows Rust's ownership model rather than mirroring the C++ class hierarchy.
+
+- **Adapter:** Evaluator and EvaluatorBuilder adapt the native Nix C API to an embedding-oriented Rust interface. They do not shadow or translate Nix runtime values.
+- **Dependency injection:** from_parts accepts a Context and Store created by the embedding application. This lets an application reuse its established store connection, logging context and configuration.
+- **Strategy / callback boundary:** register_primop accepts a closure, so a host application can inject HTTP clients, credential resolvers, internal artifact services, or mocks. Larger integrations can capture an Arc-backed service trait object.
+- **RAII:** nix-bindings wrappers release Nix GC references and C handles through Drop. Value carries a lifetime tied to EvalState so a value handle cannot safely outlive the evaluator that owns its runtime.
+- **Feature-gated capabilities:** C++ shims and flakes are opt-in Cargo features. The default build stays on the public C API.
+- **No custom Visitor over Nix expressions:** the C++ evaluator already owns the grammar, expression nodes and exhaustive evaluation dispatch. Recreating these in Rust would duplicate the source of truth and invite language drift.
+
+The primop closure is constrained by Send + Sync + 'static because it is retained by Nix's global primop registry. Its argument and result wrappers are callback-frame values and must not escape the call. For per-tenant or request-local services, prefer a process-registered dispatcher primop that consults an application-owned capability registry rather than registering a separate global primop for every tenant.
+
 ## References
 
 - Nix 2.35.6 release notes: https://nix.dev/manual/nix/2.35/release-notes/rl-2.35.html
