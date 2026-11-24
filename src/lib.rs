@@ -1,20 +1,24 @@
-//! An embeddable interpreter for the Nix expression language.
+//! A reusable Rust façade over the upstream Nix expression evaluator.
 //!
-//! The crate separates language evaluation from Nix's package manager, store, fetchers,
-//! filesystem policy, and command-line interface. Applications install native functions and
-//! a Host implementation for the effects they want to expose.
+//! This crate intentionally does not implement Nix syntax or evaluation semantics itself.
+//! Parsing, lazy evaluation, closures, builtins, coercion, string contexts, paths, and
+//! recursive attribute sets are provided by Nix's own `libexpr` through its C API.
 //!
-//! This is an early interpreter milestone, not yet a drop-in replacement for Nix's
-//! production evaluator. See DESIGN.md for the implemented surface and remaining work.
+//! The embedding application owns its integration policy: store selection, lookup paths,
+//! custom primitive operations, filesystem permissions, and any additional capabilities.
+//! See the repository README and `docs/architecture.md` for the boundary.
 
-mod eval;
-mod error;
-mod host;
-mod parser;
-mod value;
+mod evaluator;
+pub mod primop;
 
-pub use eval::{EvalContext, Evaluator};
-pub use error::{Error, ErrorKind, Result};
-pub use host::{Host, HostError, LoaderHost, SourceLoader, SourceUnit};
-pub use parser::{ParsedExpression, parse};
-pub use value::{Function, NativeCallback, NixPath, NixPathKind, Thunk, Value};
+pub use evaluator::{Evaluator, EvaluatorBuilder};
+pub use nix_bindings::{
+    Context, Derivation, Error, EvalState, EvalStateBuilder, NixValueOps, Result, Store,
+    StorePath, Value, ValueType, is_pure_eval, nix_version,
+};
+
+#[cfg(feature = "external")]
+pub use nix_bindings::external;
+
+#[cfg(feature = "flakes")]
+pub use nix_bindings::flake;
