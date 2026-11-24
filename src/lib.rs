@@ -17,7 +17,6 @@ pub use nix_bindings::{
     StorePath, Value, ValueType, is_pure_eval, nix_version,
 };
 
-#[cfg(feature = "external")]
 pub use nix_bindings::external;
 
 #[cfg(feature = "flakes")]
