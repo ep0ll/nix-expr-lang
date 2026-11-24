@@ -105,7 +105,7 @@ fn main() -> Result<()> {
 
 Primops are registered in Nix's process-wide registry. Register them before creating the evaluator state that should see them. The callback's argument and return wrappers are valid only for the duration of the callback; do not store them or move them to another thread.
 
-A custom fetcher can call the application's HTTP client, verify hashes, add content to the Nix store using the store API, and return a Nix path. The policy and network implementation stay in the embedding application; Nix remains responsible for evaluating the expression that invokes the function.
+A custom fetcher can call the application's HTTP client, verify hashes, place content in a location accessible to Nix, and return a Nix path. Store insertion should use the upstream Store APIs exposed by the linked binding. Some low-level byte-insertion and typed store-path return helpers in nix-bindings currently require the optional cpp-shim feature because the public C API does not expose every store operation. The policy and network implementation stay in the embedding application; Nix remains responsible for evaluating the expression that invokes the function.
 
 Before adding a custom fetcher, check whether Nix already provides the operation you need. The native evaluator includes its own builtins such as builtins.fetchurl, builtins.fetchTarball, builtins.fetchGit, and builtins.fetchClosure. These execute through Nix's own evaluator and store/fetcher implementation; they are not reimplemented by this crate. Their behavior remains subject to the linked Nix version, evaluator settings, network configuration and restricted/pure evaluation mode.
 
