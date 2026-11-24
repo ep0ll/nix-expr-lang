@@ -856,9 +856,25 @@ impl EvalContext {
             ));
         }
 
-        let left_value = self.force(left)?;
-        let right_value = self.force(right)?;
-        self.values_equal(&left_value, &right_value, visited)
+        let left_value = match self.force(left) {
+            Ok(value) => value,
+            Err(error) => {
+                visited.remove(&pair);
+                return Err(error);
+            }
+        };
+        let right_value = match self.force(right) {
+            Ok(value) => value,
+            Err(error) => {
+                visited.remove(&pair);
+                return Err(error);
+            }
+        };
+        let result = self.values_equal(&left_value, &right_value, visited);
+        // Track the active recursion path, not all previously compared pairs: the same
+        // acyclic shared pair may occur in more than one field.
+        visited.remove(&pair);
+        result
     }
 
     fn compare(&mut self, lhs: Value, rhs: Value, operator: BinOpKind) -> Result<Value> {
