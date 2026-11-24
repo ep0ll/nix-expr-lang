@@ -61,6 +61,17 @@ fn preserves_lazy_attribute_values_and_lists() -> Result<()> {
 
 #[test]
 #[serial]
+fn upstream_fetcher_builtins_are_part_of_the_evaluator() -> Result<()> {
+    let evaluator = Evaluator::new()?;
+    let value = evaluator.eval(
+        "builtins ? fetchurl && builtins ? fetchTarball && builtins ? fetchGit",
+    )?;
+    assert!(value.as_bool()?);
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn native_primop_is_called_by_nix() -> Result<()> {
     let mut builder = EvaluatorBuilder::new()?;
     builder.register_primop(
